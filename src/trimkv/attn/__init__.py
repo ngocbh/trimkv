@@ -3,7 +3,6 @@ import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from . import eager_attn
-from . import flex_attn
 from . import flash_attn
 
 TRIMKV_ATTENTION_IMPLEMENTATIONS = {
