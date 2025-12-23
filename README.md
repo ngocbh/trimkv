@@ -12,7 +12,7 @@ Imagine if our brain worked like a transformer:
     <img width="1000" alt="teaser" src="assets/fun.gif"/>
 </div>
 
-Our brain will explode 🧠💥 and so would your GPU. TRIM-KV lets your model forget the parts that don’t matter much, so it doesn’t melt its VRAM. Don’t let the brain explode.
+It will explode 🧠💥 and so would our GPU. TRIM-KV lets your model forget the parts that don’t matter much, so it doesn’t melt its VRAM.
 
 The core idea behind TRIM-KV is to learn the intrinsic importance of each key–value pair at creation time, what we call *token retention*, and then decay this importance exponentially over time, mimicking standard inference with eviction.
 
