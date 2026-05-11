@@ -253,7 +253,7 @@ def load_dbtrimkv_model(config):
             past_key_values = PagedTrimKVCache(
                 num_layers=model.config.text_config.num_hidden_layers,
                 num_heads=model.config.text_config.num_key_value_heads,
-                max_seq_len=32768,
+                max_seq_len=2048, # deprecated in future, it is already automatically calculated.
                 memory_size=memory_size,
                 buffer_size=config.buffer_size,
                 num_blocks_ratio=0.25,
@@ -265,7 +265,6 @@ def load_dbtrimkv_model(config):
         inputs['past_key_values'] = past_key_values
 
         return inputs
-
     return model, processor, prepare_input_for_generation
 
 def load_vanilla_model(config):

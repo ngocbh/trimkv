@@ -536,14 +536,14 @@ class DynamicBudgetTrimKVCache(TrimKVCache):
 
 
 class PagedCache:
-    def __init__(self, batch_size: int, num_layers: int, num_heads: int, max_blocks_per_head: int, head_dim : int, block_size : int, num_blocks_ratio: float = 1.0, device: str = "cuda", dtype: torch.dtype = torch.float16) -> None:
+    def __init__(self, batch_size: int, num_layers: int, num_heads: int, max_blocks_per_head: int, head_dim: int, block_size: int, num_blocks_ratio: float = 1.0, device: str = "cuda", dtype: torch.dtype = torch.float16) -> None:
         self.block_size = block_size
         self.batch_size = batch_size
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.max_blocks_per_head = max_blocks_per_head
-        self.num_blocks = int(num_layers * num_heads * max_blocks_per_head * batch_size * num_blocks_ratio) # assume half of the blocks are used on average
+        self.num_blocks = int(num_layers * num_heads * max_blocks_per_head * batch_size * num_blocks_ratio)
 
         self.block_table = torch.full(
             (num_layers, batch_size, num_heads, max_blocks_per_head),
@@ -557,26 +557,12 @@ class PagedCache:
             device=device,
         )
 
-        self.key = torch.empty(
-            self.num_blocks * block_size, head_dim,
-            dtype=dtype,
-            device=device,
-        )
-        self.value = torch.empty(
-            self.num_blocks * block_size, head_dim,
-            dtype=dtype,
-            device=device,
-        )
-        self.pos = torch.empty(
-            self.num_blocks * block_size, 1,
-            dtype=torch.int64,
-            device=device,
-        )
-        self.retention = torch.empty(
-            self.num_blocks * block_size, 1,
-            dtype=dtype,
-            device=device,
-        )
+        # Allocate one extra null-block (index = self.num_blocks = sentinel) so that any
+        # flash_attn access to the sentinel block ID reads safe zeros instead of OOB memory.
+        self.key = torch.zeros((self.num_blocks + 1) * block_size, head_dim, dtype=dtype, device=device)
+        self.value = torch.zeros((self.num_blocks + 1) * block_size, head_dim, dtype=dtype, device=device)
+        self.pos = torch.zeros((self.num_blocks + 1) * block_size, 1, dtype=torch.int64, device=device)
+        self.retention = torch.zeros((self.num_blocks + 1) * block_size, 1, dtype=dtype, device=device)
 
         self.device = device
 
@@ -586,21 +572,9 @@ class PagedCache:
             device=device,
         )
         self.num_free_blocks = self.num_blocks
-        self.block_arange = torch.arange(
-            self.block_size,
-            dtype=torch.int32,
-            device=device,
-        )
-        self.layer_arange = torch.arange(
-            self.num_layers,
-            dtype=torch.int32,
-            device=device,
-        )
-        self.head_arange = torch.arange(
-            self.num_heads,
-            dtype=torch.int32,
-            device=device,
-        )
+        self.block_arange = torch.arange(self.block_size, dtype=torch.int32, device=device)
+        self.layer_arange = torch.arange(self.num_layers, dtype=torch.int32, device=device)
+        self.head_arange = torch.arange(self.num_heads, dtype=torch.int32, device=device)
 
     def reset(self):
         self.block_table.fill_(self.num_blocks)
@@ -613,9 +587,12 @@ class PagedCache:
         )
 
     def get_free_blocks(self, num_blocks: int) -> torch.Tensor:
-        # print(self.num_free_blocks, num_blocks)
-        # print(self.free_block_indices.shape)
-        assert num_blocks <= self.num_free_blocks, "Not enough free blocks in PagedCache"
+        if num_blocks > self.num_free_blocks:
+            additional_blocks = max(self.num_blocks, num_blocks - self.num_free_blocks)
+            print(f"Expanding physical cache from {self.num_blocks} blocks to {self.num_blocks + additional_blocks} blocks to accommodate {num_blocks} requested blocks (only {self.num_free_blocks} free)")
+            self._expand_physical_cache(additional_blocks)
+            print(f"Expanded physical cache: now have {self.num_blocks} blocks, {self.num_free_blocks} free blocks")
+       
         free_blocks = self.free_block_indices[self.num_free_blocks - num_blocks:self.num_free_blocks]
         self.num_free_blocks -= num_blocks
         return free_blocks
@@ -626,7 +603,6 @@ class PagedCache:
         self.num_free_blocks += num_blocks
 
     def _ensure_token_arange(self, seq_len: int) -> torch.Tensor:
-        # cache an arange buffer to avoid reallocs
         if not hasattr(self, "_token_arange") or self._token_arange.numel() < seq_len:
             self._token_arange = torch.arange(seq_len, device=self.device, dtype=torch.int64)
         return self._token_arange[:seq_len]
@@ -637,6 +613,52 @@ class PagedCache:
         retention_weights = self.retention[global_indices]
         kv_positions = self.pos[global_indices]
         return keys, values, retention_weights, kv_positions
+
+    def _ensure_block_capacity(self, total_blocks: torch.Tensor, maxB: int, layer_idx: int, batch_slice: slice, block_table: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        if torch.any(total_blocks > maxB):
+            needed_max = int(total_blocks.max().item())
+            self._expand_block_table(needed_max)
+            maxB = self.max_blocks_per_head
+            block_table = self.block_table[layer_idx, batch_slice]
+        return block_table, maxB
+
+    def _expand_physical_cache(self, additional_blocks: int):
+        old_num_blocks = self.num_blocks
+        new_num_blocks = old_num_blocks + additional_blocks
+        old_size = old_num_blocks * self.block_size
+        new_size = new_num_blocks * self.block_size
+
+        def expand_tensor(t):
+            # Allocate new_size + block_size to keep the extra null sentinel block at the end.
+            new_t = torch.zeros((new_size + self.block_size, *t.shape[1:]), dtype=t.dtype, device=t.device)
+            new_t[:old_size] = t[:old_size]  # copy valid data only (exclude old sentinel block)
+            return new_t
+
+        self.key = expand_tensor(self.key)
+        self.value = expand_tensor(self.value)
+        self.pos = expand_tensor(self.pos)
+        self.retention = expand_tensor(self.retention)
+
+        new_free_indices = torch.arange(
+            new_num_blocks - 1, old_num_blocks - 1, -1, 
+            dtype=torch.int32, device=self.device
+        )
+        self.free_block_indices = torch.cat([new_free_indices, self.free_block_indices])
+        self.block_table[self.block_table == old_num_blocks] = new_num_blocks
+
+        self.num_blocks = new_num_blocks
+        self.num_free_blocks += additional_blocks
+
+    def _expand_block_table(self, needed_max_blocks: int):
+        pad_size = needed_max_blocks - self.max_blocks_per_head
+        padding = torch.full(
+            (self.num_layers, self.batch_size, self.num_heads, pad_size),
+            fill_value=self.num_blocks,
+            dtype=self.block_table.dtype,
+            device=self.device
+        )
+        self.block_table = torch.cat([self.block_table, padding], dim=-1)
+        self.max_blocks_per_head = needed_max_blocks
 
     def add(
         self,
@@ -651,8 +673,6 @@ class PagedCache:
         assert num_heads == self.num_heads
         assert dim == self.head_dim
 
-        # If batch_idx is provided, it's safest if caller passes a single-element batch.
-        # (Your original code would silently mis-write otherwise.)
         if batch_idx is not None:
             assert bsz == 1, "When batch_idx is set, pass tensors with bsz==1 (the selected item)."
             batch_slice = slice(batch_idx, batch_idx + 1)
@@ -666,78 +686,65 @@ class PagedCache:
         maxB = self.max_blocks_per_head
         device = self.device
 
-        # Flatten inputs in (b,h,s) order
         key_flat = rearrange(key_states,        "b h s d -> (b h s) d")
         val_flat = rearrange(value_states,      "b h s d -> (b h s) d")
         rw_flat  = rearrange(retention_weights, "b h s   -> (b h s) 1")
         pos_flat = rearrange(kv_positions,      "b h s   -> (b h s) 1")
 
-        # Views into current layer + batch slice
-        block_table = self.block_table[layer_idx, batch_slice]      # [B,H,maxB] int32 (view)
-        s0 = self.cache_seqlens[layer_idx, batch_slice].to(torch.int64)  # [B,H] old start positions (int64)
+        block_table = self.block_table[layer_idx, batch_slice]
+        s0 = self.cache_seqlens[layer_idx, batch_slice].to(torch.int64)
 
-        e0 = s0 + seq_len  # [B,H]
+        e0 = s0 + seq_len
 
-        # Compute how many new blocks each (b,h) needs
-        existing_blocks = (s0 + (BS - 1)) // BS          # ceil(s0/BS)
-        total_blocks    = (e0 + (BS - 1)) // BS          # ceil(e0/BS)
-        new_blocks      = total_blocks - existing_blocks  # [B,H] >= 0
+        existing_blocks = (s0 + (BS - 1)) // BS
+        total_blocks    = (e0 + (BS - 1)) // BS
+        new_blocks      = total_blocks - existing_blocks
 
-        # Bounds check
-        if torch.any(total_blocks > maxB):
-            # This will sync only on error path; fine for debugging.
-            mx = int(total_blocks.max().item())
-            print(f"Error: total_blocks = {total_blocks}, max_blocks_per_head = {maxB}")
-            print(f"Block table for layer {layer_idx}, batch slice {batch_slice}:\n{block_table}")
-            print(f"Existing blocks:\n{existing_blocks}")
-            raise RuntimeError(f"Exceeded max_blocks_per_head: need {mx}, have {maxB}")
+        block_table, maxB = self._ensure_block_capacity(total_blocks, maxB, layer_idx, batch_slice, block_table)
 
-        # Allocate all new blocks in one shot and scatter into block_table
-        counts = new_blocks.reshape(-1).to(torch.int64)  # [B*H]
-        total_new = int(counts.sum().item())             # single sync per call
+        counts = new_blocks.reshape(-1).to(torch.int64)
+        total_new = int(counts.sum().item())
 
         if total_new > 0:
-            free = self.get_free_blocks(total_new).to(torch.int64)  # [total_new]
+            free = self.get_free_blocks(total_new).to(torch.int64)
 
             BH = counts.numel()
-            bh = torch.arange(BH, device=device, dtype=torch.int64)         # [BH]
-            bh_rep = torch.repeat_interleave(bh, counts)                    # [total_new]
+            bh = torch.arange(BH, device=device, dtype=torch.int64)
+            bh_rep = torch.repeat_interleave(bh, counts)
 
-            start = torch.cumsum(counts, 0) - counts                        # [BH]
+            start = torch.cumsum(counts, 0) - counts
             offset = torch.arange(total_new, device=device, dtype=torch.int64) - start[bh_rep]
-            slot = existing_blocks.reshape(-1).to(torch.int64)[bh_rep] + offset  # [total_new]
+            slot = existing_blocks.reshape(-1).to(torch.int64)[bh_rep] + offset
 
             b_rep = bh_rep // H
             h_rep = bh_rep % H
 
             block_table[b_rep, h_rep, slot] = free.to(torch.int32)
 
-        # Update seqlens (store back as int32)
         self.cache_seqlens[layer_idx, batch_slice] = e0.to(torch.int32)
 
-        # Compute physical indices for the *new tokens* via gather
-        t = self._ensure_token_arange(seq_len)  # [seq_len] int64
-        logical = s0[..., None] + t[None, None, :]                # [B,H,S]
-        block_slots = (logical // BS).to(torch.int64)             # [B,H,S]
-        in_block = (logical % BS).to(torch.int64)                 # [B,H,S]
+        t = self._ensure_token_arange(seq_len)
+        logical = s0[..., None] + t[None, None, :]
+        block_slots = (logical // BS).to(torch.int64)
+        in_block = (logical % BS).to(torch.int64)
 
-        block_ids = torch.gather(block_table.to(torch.int64), dim=-1, index=block_slots)  # [B,H,S]
-        phys = block_ids * BS + in_block                                                # [B,H,S]
-        idx = phys.reshape(-1)                                                          # [(B*H*S)]
+        block_ids = torch.gather(block_table.to(torch.int64), dim=-1, index=block_slots)
+        phys = block_ids * BS + in_block
+        idx = phys.reshape(-1)
 
-        # Write
         self.key[idx] = key_flat
         self.value[idx] = val_flat
         self.retention[idx] = rw_flat
         self.pos[idx] = pos_flat
 
-
+        
+        
 class PagedTrimKVCache(TrimKVCache):
     def __init__(
         self,
         num_layers: int,
         num_heads: int,
-        max_seq_len: int,
+        max_seq_len: int | str, # will be deprecated in future
         memory_size: Optional[int] = None,
         alpha_threshold: float = None,
         buffer_size: int = 1,
@@ -758,7 +765,11 @@ class PagedTrimKVCache(TrimKVCache):
         self.sliding_window_size = sliding_window_size
         self.min_tokens_per_head = min_tokens_per_head
         self.strategy = strategy
-        self.max_seq_len = max_seq_len
+
+        self.max_seq_len = 128 # an initial value, the actual max_seq_len will be determined by the number of blocks allocated in the paged cache, which can grow dynamically as needed
+        print("Using auto-paged cache with dynamic block allocation, starting with max_seq_len = {}".format(self.max_seq_len))
+
+        # self.max_seq_len = max_seq_len
         self.device = device
         assert strategy in ['fixed_budget', 'threshold'], "Only 'fix_budget' and 'threshold' strategies are supported"
         self.do_compress = (self.strategy == "threshold" and self.alpha_threshold is not None) or (self.strategy == "fixed_budget" and self.memory_size is not None)
@@ -767,18 +778,18 @@ class PagedTrimKVCache(TrimKVCache):
 
         self.block_size = block_size
         self.num_blocks_ratio = num_blocks_ratio
-        self.max_blocks_per_head = math.ceil(max_seq_len / block_size) + 1 # add one extra block for safety, the actual number of blocks will be determined by num_blocks_ratio
+        self.max_blocks_per_head = math.ceil(self.max_seq_len / block_size) + 1 # add one extra block for safety, the actual number of blocks will be determined by num_blocks_ratio
         self.paged_cache: Optional[PagedCache] = None
 
         self.peak_cached_tokens = None
         self._seen_tokens = 0
         self.layers = []
         
-
     def initialize_paged_cache(self, key_states):
         dtype = key_states.dtype
         device = key_states.device
         bsz, _, _, dim = key_states.shape
+
 
         self.paged_cache = PagedCache(
             batch_size=bsz,
@@ -791,6 +802,7 @@ class PagedTrimKVCache(TrimKVCache):
             device=device,
             dtype=dtype,
         )
+        
 
     def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int = 0) -> tuple[int, int]:
         """Return the length and offset of the cache, used to generate the attention mask"""
@@ -875,14 +887,15 @@ class PagedTrimKVCache(TrimKVCache):
         BS = self.block_size
         L = self.num_layers
         H = self.num_key_value_heads
-        MB = self.max_blocks_per_head
+        # MB = self.max_blocks_per_head
+        MB = self.paged_cache.block_table.shape[-1]
         sentinel = int(self.paged_cache.num_blocks)
 
         if not self.do_compress:
             return
 
         for b in range(batch_size):
-            block_table = self.paged_cache.block_table[:, b, :, :]
+            block_table = self.paged_cache.block_table[:, b, :, :].contiguous()
             seqlens = self.paged_cache.cache_seqlens[:, b, :]
             total_cached_tokens = seqlens.sum().item()
 
@@ -996,6 +1009,10 @@ class PagedTrimKVCache(TrimKVCache):
             if rel_blocks.numel() > 0:
                 self.paged_cache.release_blocks(rel_blocks)
             bt[rel_mask] = sentinel
+            # Write back to the original block_table in case block_table[:, b, :, :] was non-contiguous
+            # (e.g., batch_size > 1), in which case `bt` is a copy and bt[rel_mask] = sentinel
+            # would not propagate to self.paged_cache.block_table automatically.
+            self.paged_cache.block_table[:, b, :, :] = block_table
             
             self.paged_cache.cache_seqlens[:, b, :] = new_lens.view(L, H).to(torch.int32)
             # --- compute destination global indices for compacted layout ---

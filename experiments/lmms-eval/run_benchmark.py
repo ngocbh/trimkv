@@ -71,7 +71,7 @@ class CompressionConfig:
     fixed_kv_budget: bool = field(default=True, metadata={"help": "Set to False for a fair comparison with visual token prunning methods. If set to False, the actual KV budget will be determined dynamically based on the text length, which is num_text_tokens + kv_budget."})
     strategy: str = field(default="fixed_budget", metadata={"help": "Compression strategy to use, [fixed_budget, threshold]"})
     alpha_threshold: float = field(default=0.8, metadata={"help": "Alpha threshold for compression when strategy is set to threshold"})
-    lookahead_steps: int = field(default=1, metadata={"help": "Number of lookahead steps for scoring tokens in trimkv"})
+    lookahead_steps: int = field(default=2, metadata={"help": "Number of lookahead steps for scoring tokens in trimkv"})
     visualization: bool = field(default=False, metadata={"help": "Whether to visualize the compression results"})
 
     # for RKV compression
