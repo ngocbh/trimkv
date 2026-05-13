@@ -1,6 +1,7 @@
 # TrimKV: Token Retention for Memory-Bounded Key-Value Eviction
 
 <a href="https://arxiv.org/abs/2512.03324"><img src="https://img.shields.io/badge/arxiv-2512.03324-red?style=for-the-badge"></a>
+<a href="https://arxiv.org/abs/2605.09649"><img src="https://img.shields.io/badge/arxiv-2605.09649-red?style=for-the-badge"></a>
 
 ## 🚀 Updates
 
@@ -170,6 +171,25 @@ Per-benchmark evaluation harnesses live in [`experiments/`](experiments/) — se
 | Qwen3-VL-4B-Instruct | DBTrimKV | [DBTrimKV-Qwen3-VL-4B-Instruct](https://huggingface.co/ngocbh/DBTrimKV-Qwen3-VL-4B-Instruct) | M4-Instruct, MMDU | 32K | 32 |
 
 Happy to mention here if you have your own checkpoints for different settings.
+
+---
+
+## Citation
+
+```bibtex
+@article{bui2025cache,
+  title={Cache what lasts: Token retention for memory-bounded kv cache in llms},
+  author={Bui, Ngoc and Sharma, Shubham and Lamba, Simran and Mishra, Saumitra and Ying, Rex},
+  journal={arXiv preprint arXiv:2512.03324},
+  year={2025}
+}
+@article{bui2025make,
+  title={Make Each Token Count: Towards Improving Long-Context Performance with KV Cache Eviction},
+  author={Bui, Ngoc and Nguyen, Hieu Trung and Cohan, Arman and Ying, Rex},
+  journal={arXiv preprint arXiv:2512.03324},
+  year={2025}
+}
+```
 
 ---
 
