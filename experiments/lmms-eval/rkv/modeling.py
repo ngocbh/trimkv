@@ -31,7 +31,10 @@ from .compression import (
     H2O,
     AnalysisKV,
     AdaKV,
+    CAKE,
+    HeadKV,
 )
+from .compression.cake_headkv import CakeHeadKV
 
 KV_COMPRESSION_MAP = {
     "rkv": R1KV,
@@ -41,6 +44,9 @@ KV_COMPRESSION_MAP = {
     "analysiskv": AnalysisKV,
     'adakv': AdaKV,
     'adapyramidkv': AdaKV,
+    'cake': CAKE,
+    'headkv': HeadKV,
+    'cake_headkv': CakeHeadKV,
 }
 
 logger = logging.get_logger(__name__)
@@ -237,6 +243,8 @@ def Qwen3VLTextAttention_init(
     self.config.update(compression_config)
     compression_config["method_config"]["num_hidden_layers"] = config.num_hidden_layers
     compression_config["method_config"]["layer_idx"] = layer_idx
+    compression_config["method_config"]["num_attention_heads"] = config.num_attention_heads
+    compression_config["method_config"]["num_key_value_heads"] = config.num_key_value_heads
     self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
         **compression_config["method_config"]
     )
@@ -440,6 +448,210 @@ def Qwen3VLTextAttention_adakv_forward(
     # AdaKV requires flattened batch and head dimensions and call flash_attn_varlen_func, we do the same as dbtrimkv
     attention_interface: Callable = dynamic_kv_budget_attention_forward
 
+    attn_output, attn_weights, _ = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        flash_attn_kwargs=flash_attn_kwargs,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
+
+
+def Qwen3VLTextAttention_cake_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    past_key_values: Optional[Cache] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        window_size = self.config.method_config["window_size"]
+        num_layers = self.config.num_hidden_layers
+        kv_cluster = self.kv_cluster
+        allocator = kv_cluster.allocator
+
+        if not hasattr(past_key_values, "query_cache"):
+            past_key_values.query_cache = {}
+
+        is_prefill = self.layer_idx not in past_key_values.query_cache
+
+        if is_prefill:
+            # New sample: reset the shared cross-layer allocator at layer 0.
+            if self.layer_idx == 0:
+                allocator.reset()
+
+            # Cache the last window_size queries for decode-time compression.
+            past_key_values.query_cache[self.layer_idx] = query_states[:, :, -window_size:, :]
+            cached_queries = past_key_values.query_cache[self.layer_idx]
+
+            # Compute this layer's preference + eviction scores, register with allocator.
+            # For bs>1, derive a key-padding mask so left-padded tokens are never kept
+            # (bs=1 -> key_padding stays None -> identical to the original path).
+            key_padding = None
+            if key_states.shape[0] > 1 and attention_mask is not None:
+                kv_len = key_states.shape[-2]
+                if attention_mask.dim() == 4:
+                    key_padding = attention_mask[:, 0, -1, :kv_len] < -1
+                elif attention_mask.dim() == 2:
+                    key_padding = attention_mask[:, :kv_len] == 0
+            pref_score, hh_score = kv_cluster.compute_scores(key_states, cached_queries, key_padding)
+            allocator.register(self.layer_idx, pref_score, hh_score)
+
+            # Store the FULL KV; eviction is deferred to the last layer.
+            past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+            # Once every layer has been scored, split the global budget and evict all layers.
+            if self.layer_idx == num_layers - 1:
+                q_len = key_states.shape[-2]
+                budgets = allocator.allocate(kv_cluster.total_size, q_len - window_size, num_layers)
+                for i in range(num_layers):
+                    k_c, v_c = kv_cluster.evict_prefill(
+                        past_key_values.key_cache[i],
+                        past_key_values.value_cache[i],
+                        allocator.hh_scores[i],
+                        budgets[i],
+                    )
+                    past_key_values.key_cache[i] = k_c
+                    past_key_values.value_cache[i] = v_c
+            # Prefill attention uses the full (local) key/value states below.
+        else:
+            # Decode: append current query, keep only the last window_size.
+            past_key_values.query_cache[self.layer_idx] = torch.cat(
+                (past_key_values.query_cache[self.layer_idx], query_states), dim=2
+            )[:, :, -window_size:, :]
+            cached_queries = past_key_values.query_cache[self.layer_idx]
+
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+            # Decode-time eviction at step boundaries; cap this layer at its own budget.
+            if self.config.compression is True:
+                budget_i = allocator.layer_budget.get(self.layer_idx, kv_cluster.budget - window_size)
+                k_c, v_c = kv_cluster.decode_evict(key_states, value_states, cached_queries, budget_i)
+                past_key_values.key_cache[self.layer_idx] = k_c
+                past_key_values.value_cache[self.layer_idx] = v_c
+            # Attention still uses the full (pre-eviction) cache for this step.
+
+    attention_interface: Callable = eager_attention_forward
+    if self.config._attn_implementation != "eager":
+        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
+
+
+def Qwen3VLTextAttention_cake_headkv_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    past_key_values: Optional[Cache] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        window_size = self.config.method_config["window_size"]
+        num_layers = self.config.num_hidden_layers
+        kv_cluster = self.kv_cluster
+        allocator = kv_cluster.allocator
+
+        if not hasattr(past_key_values, "query_cache"):
+            past_key_values.query_cache = {}
+        is_prefill = self.layer_idx not in past_key_values.query_cache
+
+        if is_prefill:
+            if self.layer_idx == 0:
+                allocator.reset()
+            past_key_values.query_cache[self.layer_idx] = query_states[:, :, -window_size:, :]
+            cached_queries = past_key_values.query_cache[self.layer_idx]
+            # store FULL flattened KV; defer eviction to the last layer (CAKE needs all layers' pref)
+            key_states, value_states, head_lens, cu_seqlens_k = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+            pref, hh = kv_cluster.compute_scores(key_states, cached_queries, head_lens, cu_seqlens_k, need_pref=True)
+            allocator.register(self.layer_idx, pref, hh, head_lens, cu_seqlens_k)
+            flash_attn_kwargs = {"head_lens": head_lens, "cu_seqlens_k": cu_seqlens_k}  # FULL for prefill attn
+            if self.layer_idx == num_layers - 1:
+                q_len = query_states.shape[2]
+                caps = allocator.allocate(
+                    kv_cluster.total_size, num_layers, kv_cluster.num_key_value_heads,
+                    q_len - window_size, kv_cluster.head_weight,
+                )
+                for i in range(num_layers):
+                    k_c, v_c, hl_c, cu_c = kv_cluster.evict_layer(
+                        past_key_values.key_cache[i], past_key_values.value_cache[i],
+                        allocator.hh[i], allocator.head_lens[i], allocator.cu[i], caps[i],
+                    )
+                    past_key_values.key_cache[i] = k_c
+                    past_key_values.value_cache[i] = v_c
+                    past_key_values.head_lens[i] = hl_c
+                    past_key_values.cu_seqlens_k[i] = cu_c
+        else:
+            past_key_values.query_cache[self.layer_idx] = torch.cat(
+                (past_key_values.query_cache[self.layer_idx], query_states), dim=2
+            )[:, :, -window_size:, :]
+            cached_queries = past_key_values.query_cache[self.layer_idx]
+            key_states, value_states, head_lens, cu_seqlens_k = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+            flash_attn_kwargs = {"head_lens": head_lens, "cu_seqlens_k": cu_seqlens_k}  # attend full-this-step
+            if self.config.compression is True:
+                cap = allocator.layer_budget[self.layer_idx]
+                _, hh = kv_cluster.compute_scores(key_states, cached_queries, head_lens, cu_seqlens_k, need_pref=False)
+                k_c, v_c, hl_c, cu_c = kv_cluster.evict_layer(key_states, value_states, hh, head_lens, cu_seqlens_k, cap)
+                past_key_values.key_cache[self.layer_idx] = k_c
+                past_key_values.value_cache[self.layer_idx] = v_c
+                past_key_values.head_lens[self.layer_idx] = hl_c
+                past_key_values.cu_seqlens_k[self.layer_idx] = cu_c
+    else:
+        raise NotImplementedError("CakeHeadKV only supports decoding with cache.")
+
+    attention_interface: Callable = dynamic_kv_budget_attention_forward
     attn_output, attn_weights, _ = attention_interface(
         self,
         query_states,

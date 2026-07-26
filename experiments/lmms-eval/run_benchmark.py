@@ -86,6 +86,19 @@ class CompressionConfig:
     # for streamingllm
     first_tokens: int = field(default=4, metadata={"help": "First tokens for compression"})
 
+    # for CAKE (arXiv 2503.12491) — per-layer adaptive budget allocation
+    tau1: float = field(default=1.6, metadata={"help": "CAKE dispersion (entropy) temperature exponent"})
+    tau2: float = field(default=0.6, metadata={"help": "CAKE variance (temporal-shift) temperature exponent"})
+    gamma: float = field(default=200.0, metadata={"help": "CAKE weight of the variance term in the eviction indicator"})
+    cake_window_size: int = field(default=32, metadata={"help": "CAKE observation-window size (kept verbatim, excluded from budget)"})
+    cake_kernel_size: int = field(default=5, metadata={"help": "CAKE pooling kernel size"})
+
+    # for HeadKV (arXiv 2410.19258) — per-head static importance-weighted budget
+    headkv_beta: float = field(default=1.2, metadata={"help": "HeadKV pool-vs-floor split (smaller -> more redistribution)"})
+    headkv_temp: float = field(default=1.0, metadata={"help": "HeadKV head-score sharpening exponent"})
+    head_score_path: str = field(default=None, metadata={"help": "Path to HeadKV head-importance JSON (defaults to rkv/head_score/<model>_<choice>.json)"})
+    head_choice: str = field(default="reason", metadata={"help": "HeadKV head-score variant: 'reason' (R2) or 'copy' (R1)"})
+
     def update_from_dict(self, args):
         for f in fields(self):
             if f.name in args:

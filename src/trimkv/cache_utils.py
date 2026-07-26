@@ -52,6 +52,25 @@ def compute_log_G(
     return log_G
 
 
+def _segment_sum_mask(mask: torch.Tensor, segment_lengths: torch.Tensor) -> torch.Tensor:
+    """Count the True entries of a 1-D boolean ``mask`` within each contiguous segment
+    defined by ``segment_lengths`` (which must sum to ``mask.numel()``).
+
+    Fully vectorized replacement for the per-segment Python loop
+    ``[mask[a:b].sum() for a, b in zip(bounds[:-1], bounds[1:])]``: it prefix-sums the
+    mask once and takes differences at the segment boundaries, so it launches a handful
+    of GPU kernels with **no host synchronizations** (the loop version issues one
+    ``.sum()``/``.item()`` per segment). Result is ``int32`` with the same shape as
+    ``segment_lengths``. Used to rebuild per-head KV lengths after eviction.
+    """
+    device = mask.device
+    pref = torch.zeros(mask.numel() + 1, device=device, dtype=torch.int32)
+    torch.cumsum(mask.to(torch.int32), 0, out=pref[1:])
+    bounds = torch.zeros(segment_lengths.numel() + 1, device=device, dtype=torch.long)
+    torch.cumsum(segment_lengths.long(), 0, out=bounds[1:])
+    return (pref[bounds[1:]] - pref[bounds[:-1]]).to(torch.int32)
+
+
 class TrimKVCache(DynamicCache):
     def __init__(
         self,
@@ -440,21 +459,28 @@ class DynamicBudgetTrimKVCache(TrimKVCache):
             else: # thresholding strategy
                 topk_mask = scores >= torch.log(torch.tensor(self.alpha_threshold, device=device))
 
-            # compute budget for each head and layer
+            # New per-(layer, head) kept-token counts for ALL layers/heads at once, via a
+            # segmented sum over topk_mask (see _segment_sum_mask). Replaces the former
+            # per-head Python loop (`torch.tensor([layer_mask[...].sum() for h in ...])`),
+            # which issued L*H host-syncing `.sum()` calls per eviction; this is bit-identical
+            # and ~200x faster. topk_mask is laid out layer-major then head-major, matching
+            # the concatenation order of self.head_lens.
+            head_lens_all = torch.cat([self.head_lens[l] for l in range(num_layers)])  # (L*H,)
+            new_head_lens = _segment_sum_mask(topk_mask, head_lens_all).view(
+                num_layers, num_key_value_heads
+            )  # (L, H) int32
+            # per-layer token counts to split the mask (shape[0] is a Python int -> no sync)
+            layer_lens_list = [self.retention_weights[l].shape[0] for l in range(num_layers)]
+            layer_masks = torch.split(topk_mask, layer_lens_list)
+
             for l in range(num_layers):
-                start = cu_layer_lens[l].item()
-                end = cu_layer_lens[l + 1].item()
-                layer_mask = topk_mask[start:end]  # (S_l,)
+                layer_mask = layer_masks[l]  # (S_l,)
                 self.key_cache[l] = self.key_cache[l][layer_mask, ...]
                 self.value_cache[l] = self.value_cache[l][layer_mask, ...]
                 self.retention_weights[l] = self.retention_weights[l][layer_mask, ...]
                 self.kv_positions[l] = self.kv_positions[l][layer_mask, ...]
 
-                self.head_lens[l] = torch.tensor(
-                    [layer_mask[self.cu_seqlens_k[l][h]:self.cu_seqlens_k[l][h+1]].sum() for h in range(num_key_value_heads)],
-                    device=device,
-                    dtype=torch.int32,
-                )
+                self.head_lens[l] = new_head_lens[l].contiguous()
 
                 self.cu_seqlens_k[l] = torch.cumsum(
                     torch.cat([torch.zeros(1, device=device, dtype=torch.int32), self.head_lens[l]], dim=0),
@@ -504,11 +530,9 @@ class DynamicBudgetTrimKVCache(TrimKVCache):
                 self.retention_weights[l] = self.retention_weights[l][layer_topk_mask, ...]
                 self.kv_positions[l] = self.kv_positions[l][layer_topk_mask, ...]
 
-                self.head_lens[l] = torch.tensor(
-                    [layer_topk_mask[self.cu_seqlens_k[l][h]:self.cu_seqlens_k[l][h+1]].sum() for h in range(num_key_value_heads)],
-                    device=device,
-                    dtype=torch.int32,
-                )
+                # vectorized per-head kept-token counts (old self.head_lens[l] gives the
+                # segment boundaries; bit-identical to the former per-head .sum() loop)
+                self.head_lens[l] = _segment_sum_mask(layer_topk_mask, self.head_lens[l])
 
                 self.cu_seqlens_k[l] = torch.cumsum(
                     torch.cat([torch.zeros(1, device=device, dtype=torch.int32), self.head_lens[l]], dim=0),

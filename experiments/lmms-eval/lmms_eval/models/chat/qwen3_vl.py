@@ -1,3 +1,4 @@
+import gc
 import os
 import time
 from typing import List, Optional, Tuple, Union
@@ -153,6 +154,13 @@ class Qwen3_VL(Qwen3_VLSimple):
                 eval_logger.debug(f"Question: {context}")
                 eval_logger.debug(f"Model Raw Response: {ans}")
                 eval_logger.debug(f"Model Clean Response: {clean_ans}")
+
+            # [MODIFIED] Free per-sample memory. Video decoding (decord) otherwise
+            # accumulates CPU RAM across samples (~tens of GB/video for long clips),
+            # OOM-killing long video-eval jobs. Explicit del + gc.collect() fixes it.
+            del inputs, cont, generated_ids_trimmed, answers
+            gc.collect()
+            torch.cuda.empty_cache()
             # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
 

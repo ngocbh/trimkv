@@ -15,7 +15,9 @@ from transformers import LlavaForConditionalGeneration, Qwen3VLForConditionalGen
 
 from rkv.dynamic_cache import RKVDynamicCache
 from rkv.adakv_cache import AdaKVDynamicCache
-from rkv.monkeypatch import replace_qwen3vl, update_qwen3vl_compression_config, replace_qwen3vl_adakv
+from rkv.compression import CakeAllocator
+from rkv.compression.cake_headkv import CakeHeadKVAllocator
+from rkv.monkeypatch import replace_qwen3vl, update_qwen3vl_compression_config, replace_qwen3vl_adakv, replace_qwen3vl_cake, replace_qwen3vl_cake_headkv
 
 
 def _compute_qwen_text_tokens(inputs, processor):
@@ -380,6 +382,85 @@ def load_rkv_model(config):
 
     return model, processor, prepare_input_for_generation
 
+def load_cake_model(config):
+    # One CakeAllocator shared across all layers (accumulates per-layer preference
+    # scores during prefill, then splits the global budget across layers).
+    cake_allocator = CakeAllocator()
+    compression_config = {
+        "method": config.method,
+        "method_config": {
+            "budget": config.kv_budget,
+            "window_size": config.cake_window_size,
+            "kernel_size": config.cake_kernel_size,
+            "tau1": config.tau1,
+            "tau2": config.tau2,
+            "gamma": config.gamma,
+            "allocator": cake_allocator,
+        },
+        "compression": None,
+        "update_kv": True
+    }
+    model_config = {
+        "divide_method": config.divide_method,
+        "divide_length": config.divide_length,
+        "compression_content": config.compression_content,
+    }
+    # apply monkey patch
+    if config.model_type == "qwen3_vl":
+        replace_qwen3vl_cake(compression_config)
+        model_cls = Qwen3VLForConditionalGeneration
+        compute_text_tokens_fn = _compute_qwen_text_tokens
+        update_compression_config_fn = update_qwen3vl_compression_config
+    else:
+        raise ValueError(f"Unsupported model: {config.model_type}")
+
+    model = model_cls.from_pretrained(
+        config.model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation=config.attn_implementation,
+    )
+
+    processor = AutoProcessor.from_pretrained(
+        config.model_path,
+        padding_side="left",
+    )
+    if 'qwen' in config.model_type:
+        update_processor_pixels(processor, config)
+
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+
+    model.config.update(model_config)
+
+    model.newline_token_ids = [
+        processor.tokenizer.encode("\n")[-1],
+        processor.tokenizer.encode(".\n")[-1],
+        processor.tokenizer.encode(")\n")[-1],
+        processor.tokenizer.encode("\n\n")[-1],
+        processor.tokenizer.encode(".\n\n")[-1],
+        processor.tokenizer.encode(")\n\n")[-1],
+    ]
+
+    model.after_think_token_ids = [
+        processor.tokenizer.encode("</think>")[-1],
+    ]
+
+    def prepare_input_for_generation(model, inputs, **kwargs):
+        if not config.fixed_kv_budget:
+            num_text_tokens = compute_text_tokens_fn(inputs, processor)
+            budget = config.kv_budget + num_text_tokens
+            update_compression_config_fn(model, budget=budget)
+
+        past_key_values = RKVDynamicCache()
+        inputs['past_key_values'] = past_key_values
+
+        return inputs
+
+    return model, processor, prepare_input_for_generation
+
+
 def load_adapyramidkv_model(config):
     compression_config = {
         "method": config.method,
@@ -533,6 +614,162 @@ def load_adakv_model(config):
     return model, processor, prepare_input_for_generation
 
 
+def load_headkv_model(config):
+    compression_config = {
+        "method": config.method,
+        "method_config": {
+            "budget": config.kv_budget,
+            "window_size": config.window_size,
+            "beta": config.headkv_beta,
+            "temp": config.headkv_temp,
+            "head_score_path": config.head_score_path,
+            "head_choice": config.head_choice,
+        },
+        "compression": True,
+        "update_kv": True
+    }
+    model_config = {
+        "divide_method": config.divide_method,
+        "divide_length": config.divide_length,
+        "compression_content": config.compression_content,
+    }
+    # apply monkey patch (HeadKV reuses the AdaKV flattened cache + attention forward)
+    if config.model_type == "qwen3_vl":
+        replace_qwen3vl_adakv(compression_config)
+        model_cls = Qwen3VLForConditionalGeneration
+        compute_text_tokens_fn = _compute_qwen_text_tokens
+        update_compression_config_fn = update_qwen3vl_compression_config
+    else:
+        raise ValueError(f"Unsupported model: {config.model_type}")
+
+    model = model_cls.from_pretrained(
+        config.model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation=config.attn_implementation,
+    )
+
+    processor = AutoProcessor.from_pretrained(
+        config.model_path,
+        padding_side="left",
+    )
+    if 'qwen' in config.model_type:
+        update_processor_pixels(processor, config)
+
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+
+    model.config.update(model_config)
+
+    model.newline_token_ids = [
+        processor.tokenizer.encode("\n")[-1],
+        processor.tokenizer.encode(".\n")[-1],
+        processor.tokenizer.encode(")\n")[-1],
+        processor.tokenizer.encode("\n\n")[-1],
+        processor.tokenizer.encode(".\n\n")[-1],
+        processor.tokenizer.encode(")\n\n")[-1],
+    ]
+
+    model.after_think_token_ids = [
+        processor.tokenizer.encode("</think>")[-1],
+    ]
+
+    def prepare_input_for_generation(model, inputs, **kwargs):
+        if not config.fixed_kv_budget:
+            num_text_tokens = compute_text_tokens_fn(inputs, processor)
+            budget = config.kv_budget + num_text_tokens
+            update_compression_config_fn(model, budget=budget)
+
+        past_key_values = AdaKVDynamicCache()
+        inputs['past_key_values'] = past_key_values
+
+        return inputs
+
+    return model, processor, prepare_input_for_generation
+
+
+def load_cake_headkv_model(config):
+    # CAKE (dynamic per-layer budget) x HeadKV (static within-layer head weights),
+    # on the AdaKV flattened per-head cache with CAKE-style deferred eviction.
+    cake_headkv_allocator = CakeHeadKVAllocator()
+    compression_config = {
+        "method": config.method,
+        "method_config": {
+            "budget": config.kv_budget,
+            "window_size": config.cake_window_size,
+            "kernel_size": config.cake_kernel_size,
+            "tau1": config.tau1,
+            "tau2": config.tau2,
+            "gamma": config.gamma,
+            "temp": config.headkv_temp,
+            "head_score_path": config.head_score_path,
+            "head_choice": config.head_choice,
+            "allocator": cake_headkv_allocator,
+        },
+        "compression": None,
+        "update_kv": True
+    }
+    model_config = {
+        "divide_method": config.divide_method,
+        "divide_length": config.divide_length,
+        "compression_content": config.compression_content,
+    }
+    if config.model_type == "qwen3_vl":
+        replace_qwen3vl_cake_headkv(compression_config)
+        model_cls = Qwen3VLForConditionalGeneration
+        compute_text_tokens_fn = _compute_qwen_text_tokens
+        update_compression_config_fn = update_qwen3vl_compression_config
+    else:
+        raise ValueError(f"Unsupported model: {config.model_type}")
+
+    model = model_cls.from_pretrained(
+        config.model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation=config.attn_implementation,
+    )
+
+    processor = AutoProcessor.from_pretrained(
+        config.model_path,
+        padding_side="left",
+    )
+    if 'qwen' in config.model_type:
+        update_processor_pixels(processor, config)
+
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+
+    model.config.update(model_config)
+
+    model.newline_token_ids = [
+        processor.tokenizer.encode("\n")[-1],
+        processor.tokenizer.encode(".\n")[-1],
+        processor.tokenizer.encode(")\n")[-1],
+        processor.tokenizer.encode("\n\n")[-1],
+        processor.tokenizer.encode(".\n\n")[-1],
+        processor.tokenizer.encode(")\n\n")[-1],
+    ]
+
+    model.after_think_token_ids = [
+        processor.tokenizer.encode("</think>")[-1],
+    ]
+
+    def prepare_input_for_generation(model, inputs, **kwargs):
+        if not config.fixed_kv_budget:
+            num_text_tokens = compute_text_tokens_fn(inputs, processor)
+            budget = config.kv_budget + num_text_tokens
+            update_compression_config_fn(model, budget=budget)
+
+        past_key_values = AdaKVDynamicCache()
+        inputs['past_key_values'] = past_key_values
+
+        return inputs
+
+    return model, processor, prepare_input_for_generation
+
+
 LOADER_MAP = {
     "vanilla": load_vanilla_model,
     "trimkv": load_trimkv_model,
@@ -542,6 +779,9 @@ LOADER_MAP = {
     "rkv": load_rkv_model,
     "adakv": load_adakv_model,
     "adapyramidkv": load_adapyramidkv_model,
+    "cake": load_cake_model,
+    "headkv": load_headkv_model,
+    "cake_headkv": load_cake_headkv_model,
 }
 
 
@@ -550,7 +790,7 @@ def load_model(config):
     load_model_fn = LOADER_MAP[config.method]
 
     model_args = simple_parse_args_string(config.model_args)
-    model_args['batch_size'] = config.batch_size if config.method not in ['adakv', 'adapyramidkv'] else 1  #  AdaKV does not support batch_size > 1
+    model_args['batch_size'] = config.batch_size if config.method not in ['adakv', 'adapyramidkv', 'headkv', 'cake_headkv'] else 1  #  AdaKV / HeadKV / CakeHeadKV use the flattened per-head cache (bs=1 only); CAKE (standard cache) supports bs>1
     model_args['load_model_fn'] = partial(load_model_fn, config=config)
 
     lmms_model_cls = get_model(config.model_type)
